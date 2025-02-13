@@ -2,4 +2,4 @@ sam2-main
 AutoSAM
 output.log
 results
-datasets/polypgen
+datasets/polypgen/

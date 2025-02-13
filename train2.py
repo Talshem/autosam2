@@ -93,20 +93,27 @@ def postprocess_masks(masks_dict):
     return masks, ious
 
 
-def train_single_epoch(ds, model, sam2, optimizer, transform, epoch):
+def train_single_epoch(ds, model, sam2, optimizer, epoch):
     loss_list = []
-    pbar = tqdm(ds)
+    progress_bar = tqdm(ds)
     criterion = nn.BCELoss()
     Idim = int(args['Idim'])
     optimizer.zero_grad()
-    for ix, (videos, gts, size) in enumerate(pbar):
+    for ix, (videos, gts, size) in enumerate(progress_bar):
+        # tensor of frames per video
         videos = videos.to(sam2.device)
+
+        # tensor of ground truth masks per video
         gts = gts.to(sam2.device)
+
+        # AutoSAM automatic prompt embedding based on the first frame
         dense_embeddings = model(videos[:, 0])
+
+        # Generate Normalized Output
         masks = norm_batch(sam2_call(videos, sam2, dense_embeddings))
         loss = gen_step(optimizer, gts, masks, criterion, accumulation_steps=4, step=ix)
         loss_list.append(loss)
-        pbar.set_description(
+        progress_bar.set_description(
             '(train | {}) epoch {epoch} ::'
             ' loss {loss:.4f}'.format(
                 'Medical',
@@ -121,27 +128,37 @@ def sam2_call(videos, sam2, dense_embeddings):
         memory_bank = []
         predicted_masks = []
         for f in range(F):
+            
+            # image embedding using sam2 image encoder
             image_embeddings = sam2.image_encoder(videos[:, f])
-            sparse_embeddings_none, dense_embeddings_none = sam2.prompt_encoder(points=None, boxes=None, masks=None)
-            image_pe=sam2.prompt_encoder.get_dense_pe()
+            # empty prompt embedding using sam2 prompt encoder
+            sparse_embeddings_none, dense_embeddings_none = sam2.sam_prompt_encoder(points=None, boxes=None, masks=None)
 
             if len(memory_bank) == 0:
-                memory, memory_pos = None, None
-            else:
-                memory = torch.stack([m["features"] for m in memory_bank], dim=0)
-                memory_pos = torch.stack([m["pos_enc"] for m in memory_bank], dim=0)
-
+                memory_bank.append({
+                    # appending to memory the features of the first frame
+                    "features": image_embeddings["vision_features"],
+                    # takes positional encoding with highest resolution
+                    "pos_enc": image_embeddings["vision_pos_enc"][-1]
+                })
+           
+            # Converting to torch tensor
+            memory = torch.stack([m["features"] for m in memory_bank], dim=0)
+            memory_pos = torch.stack([m["pos_enc"] for m in memory_bank], dim=0)
+            
+            # Updating features of the next frame based on previous memory
             updated_features = sam2.memory_attention(
-                curr=image_embeddings,
-                curr_pos=image_pe,
+                curr=image_embeddings["vision_features"].permute(0, 2, 3, 1), # Permuting since dims class in memory attention
+                curr_pos=image_embeddings["vision_pos_enc"][-1].permute(0, 2, 3, 1), # Permuting since dims class in memory attention
                 memory=memory,
                 memory_pos=memory_pos,
-                num_obj_ptr_tokens=0
+                num_obj_ptr_tokens=0 # Since no point prompt was actually inserted
             )
-            
+
+            # Decoding the mask based on the memory-based updated embeddings and initial frame AutoSAM automatic-prompt embedding
             output_mask, _ = sam2.mask_decoder(
-                image_embeddings=updated_features,
-                image_pe=sam2.prompt_encoder.get_dense_pe(),
+                image_embeddings=updated_features["vision_features"],
+                image_pe=updated_features["vision_pos_enc"][-1],
                 sparse_prompt_embeddings=sparse_embeddings_none,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=False,
@@ -149,15 +166,19 @@ def sam2_call(videos, sam2, dense_embeddings):
             
             predicted_masks.append(output_mask)
 
+            # Encoding the memory of the recent frame based on its features and predicted mask
             encoded_memory = sam2.memory_encoder(updated_features, output_mask)
-
+            
+            # makes sure memory bank do not exceed the number of masks in memory parameted initiated in the model
             if len(memory_bank) >= sam2.num_maskmem:
                 memory_bank.pop(1)
             
+            # Appending in frames {sam2.memory_temporal_stride_for_eval} intervals the encoded memory
+             
             if f % sam2.memory_temporal_stride_for_eval == 0:
                 memory_bank.append({
                     "features": encoded_memory["vision_features"],
-                    "pos_enc": encoded_memory["vision_pos_enc"]
+                    "pos_enc": encoded_memory["vision_pos_enc"][-1]
                 })
 
         return torch.stack(predicted_masks, dim=1)
@@ -203,12 +224,12 @@ def main(args=None, sam_args=None):
 
     sam2 = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     
-    transform = SAM2Transforms(sam2.image_encoder.img_size, 0.5)
+    transform = SAM2Transforms(sam2.image_size, 0.5)
     optimizer = optim.Adam(model.parameters(),
                            lr=float(args['learning_rate']),
                            weight_decay=float(args['WD'])
                            )
-    trainset, testset = get_dataset(args, sam_trans=transform) 
+    trainset, testset = get_dataset(args) 
 
     ds = torch.utils.data.DataLoader(trainset, batch_size=int(args['Batch_size']), shuffle=True,
                                      num_workers=int(args['nW']), drop_last=True)
@@ -232,6 +253,7 @@ def main(args=None, sam_args=None):
 
 
 if __name__ == '__main__':
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
     import argparse
     parser = argparse.ArgumentParser(description='Description of your program')
     parser.add_argument('-lr', '--learning_rate', default=0.0003, help='learning_rate', required=False)
@@ -240,7 +262,7 @@ if __name__ == '__main__':
     parser.add_argument('-nW', '--nW', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-nW_eval', '--nW_eval', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-WD', '--WD', default=1e-4, help='evaluation iteration', required=False)
-    parser.add_argument('-task', '--task', default='polpgen', help='evaluation iteration', required=False)
+    parser.add_argument('-task', '--task', default='polypgen', help='evaluation iteration', required=False)
     parser.add_argument('-depth_wise', '--depth_wise', default=False, help='image size', required=False)
     parser.add_argument('-order', '--order', default=85, help='image size', required=False)
     parser.add_argument('-Idim', '--Idim', default=512, help='image size', required=False)

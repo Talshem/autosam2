@@ -9,6 +9,7 @@ import numpy as np
 import torchvision.datasets as tvdataset
 from datasets.tfs import get_transform
 import cv2
+from tqdm import tqdm
 
 def _load_img_as_tensor(img_path, image_size):
     img_pil = Image.open(img_path)
@@ -22,7 +23,7 @@ def _load_img_as_tensor(img_path, image_size):
     return img, video_height, video_width
 
 def load_videos_from_jpg_images(
-    video_paths,
+    video_path,
     image_size,
     mask,
     offload_video_to_cpu=False,
@@ -32,10 +33,10 @@ def load_videos_from_jpg_images(
     compute_device=torch.device("cuda"),
 ):
     """
-    Load frames from a PyTorch video_paths containing video frame directories (batch processing).
+    Load frames from a PyTorch video_path containing video frame directory.
     
     Parameters:
-        video_paths (torch.utils.data.DataLoader): video_paths with video frame directories.
+        video_path (torch.utils.data.DataLoader): video_path with video frames directory.
         image_size (int): Size to resize frames to (square resolution).
         offload_video_to_cpu (bool): If True, keeps video tensors on CPU.
         img_mean (tuple): Mean for normalization.
@@ -44,54 +45,40 @@ def load_videos_from_jpg_images(
         compute_device (torch.device): Device to load tensors to (CPU/GPU).
     
     Returns:
-        videos (torch.Tensor): Batch of videos, shape (B, T, 3, H, W).
-        video_heights (list): Heights of original videos.
-        video_widths (list): Widths of original videos.
+        images (torch.Tensor): images of video, shape (T, 3, H, W).
+        video_heights (list): Height of original video.
+        video_widths (list): Width of original video.
     """
-    batch_images = []
-    batch_heights = []
-    batch_widths = []
-    
-    for batch in tqdm(video_paths, desc="Loading videos in batch"):
-        for video_path in batch:
-            if not os.path.isdir(video_path):
-                raise ValueError(f"Invalid directory: {video_path}")
-            
-            frame_names = sorted(
-                [p for p in os.listdir(video_path) if p.lower().endswith(('.jpg', '.jpeg'))],
-                key=lambda p: int(os.path.splitext(p)[0])
-            )
-            num_frames = len(frame_names)
-            if num_frames == 0:
-                raise RuntimeError(f"No images found in {video_path}")
-            
-            img_paths = [os.path.join(video_path, fname) for fname in frame_names]
-            img_mean_tensor = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-            img_std_tensor = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
-            images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-            for n, img_path in enumerate(img_paths):
-                images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+    if not os.path.isdir(video_path):
+        raise ValueError(f"Invalid directory: {video_path}")
             
-            if not offload_video_to_cpu:
-                images = images.to(compute_device)
-                img_mean_tensor = img_mean_tensor.to(compute_device)
-                img_std_tensor = img_std_tensor.to(compute_device)
+    frame_names = sorted(
+        [p for p in os.listdir(video_path) if p.lower().endswith(('.jpg', '.jpeg'))],
+        key=lambda p: int(os.path.splitext(p)[0])
+    )
+    num_frames = len(frame_names)
+    if num_frames == 0:
+        raise RuntimeError(f"No images found in {video_path}")
             
-            # Normalize by mean and std
-            if not mask:
-                images = (images - img_mean_tensor) / img_std_tensor
+    img_paths = [os.path.join(video_path, fname) for fname in frame_names]
+    img_mean_tensor = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std_tensor = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    for n, img_path in enumerate(img_paths):
+        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
             
-            batch_images.append(images)
-            batch_heights.append(video_height)
-            batch_widths.append(video_width)
-    
-    # Stack videos into a single tensor (B, T, C, H, W)
-    videos = torch.nn.utils.rnn.pad_sequence(batch_images, batch_first=True)
-    video_heights = torch.tensor(batch_heights, dtype=torch.int32)
-    video_widths = torch.tensor(batch_widths, dtype=torch.int32)
-    
-    return videos, (video_heights, video_widths)
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean_tensor = img_mean_tensor.to(compute_device)
+        img_std_tensor = img_std_tensor.to(compute_device)
+            
+    # Normalize by mean and std
+    if not mask:
+        images = (images - img_mean_tensor) / img_std_tensor
+
+    return images, (video_height, video_width)
 
 
 def cv2_loader(path, is_mask):
@@ -108,18 +95,19 @@ def cv2_loader(path, is_mask):
     return frames
 
 
-class VideoLoader(torch.utils.data.Dataset):
-    def __init__(self, root, transform=None, target_transform=None, train=False, loader=cv2_loader,
+class VideoDataset(torch.utils.data.Dataset):
+    def __init__(self, root, image_size, transform=None, target_transform=None, train=False, loader=cv2_loader,
                  sam_trans=None, loops=1):
         self.root = root
         if train:
             self.video_root = os.path.join(self.root, 'Training', 'images')
-            self.masks_root = os.path.join(self.root, 'Training', 'mask')
+            self.masks_root = os.path.join(self.root, 'Training', 'masks')
         else:
             self.video_root = os.path.join(self.root, 'Test', 'images')
-            self.masks_root = os.path.join(self.root, 'Test', 'mask')
+            self.masks_root = os.path.join(self.root, 'Test', 'masks')
         self.paths = os.listdir(self.video_root)
         self.transform = transform
+        self.image_size = image_size
         self.target_transform = target_transform
         self.loader = loader
         self.train = train
@@ -128,14 +116,14 @@ class VideoLoader(torch.utils.data.Dataset):
         print('num of data:{}'.format(len(self.paths)))
 
     def __getitem__(self, index):
-        index = index % len(self.paths)
+        index = index % len(self.root)
         file_path = self.paths[index]
 
         video_path = os.path.join(self.video_root, file_path)
         mask_path = os.path.join(self.masks_root, file_path)
 
-        videos, size = load_videos_from_jpg_images(video_path, args=['Idim'], mask=False)
-        gts, gts_size = load_videos_from_jpg_images(mask_path, args=['Idim'], mask=True)
+        videos, size = load_videos_from_jpg_images(video_path, self.image_size, mask=False)
+        gts, gts_size = load_videos_from_jpg_images(mask_path, self.image_size, mask=True)
 
 
         # return self.sam_trans.preprocess(frames), self.sam_trans.preprocess(masks), torch.Tensor(
@@ -147,16 +135,15 @@ class VideoLoader(torch.utils.data.Dataset):
         return len(self.paths) * self.loops
 
 
-def get_dataset(args, transofrm):
+def get_dataset(args):
     datadir = args['task']
-    # transform_train, transform_test = get_something_transform(args)
-    ds_train = VideoLoader(datadir, train=True, sam_trans=sam_trans, loops=5)
-    ds_test = VideoLoader(datadir, train=False, sam_trans=sam_trans)
+    transform_train, transform_test = get_transform(datadir)
+    ds_train = VideoDataset(f"datasets/{datadir}", train=True, sam_trans=transform_train, image_size=args['Idim'], loops=5)
+    ds_test = VideoDataset(f"datasets/{datadir}", train=False, sam_trans=transform_test, image_size=args['Idim'])
     return ds_train, ds_test
 
 
 if __name__ == "__main__":
-    from tqdm import tqdm
     import argparse
     import os
     from sam2.sam2_video_predictor import SAM2VideoPredictor

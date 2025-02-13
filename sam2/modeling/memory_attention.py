@@ -126,26 +126,20 @@ class MemoryAttention(nn.Module):
     ):
         if isinstance(curr, list):
             assert isinstance(curr_pos, list)
-            assert len(curr) == len(curr_pos) == 1
-            curr, curr_pos = (
-                curr[0],
-                curr_pos[0],
-            )
-
         assert (
-            curr.shape[1] == memory.shape[1]
+            curr.shape[0] == memory.shape[0]
         ), "Batch size must be the same for curr and memory"
 
         output = curr
         if self.pos_enc_at_input and curr_pos is not None:
             output = output + 0.1 * curr_pos
 
-        if self.batch_first:
-            # Convert to batch first
-            output = output.transpose(0, 1)
-            curr_pos = curr_pos.transpose(0, 1)
-            memory = memory.transpose(0, 1)
-            memory_pos = memory_pos.transpose(0, 1)
+        # if self.batch_first:
+        #     # Convert to batch first
+        #     output = output.transpose(0, 1)
+        #     curr_pos = curr_pos.transpose(0, 1)
+        #     memory = memory.transpose(0, 1)
+        #     memory_pos = memory_pos.transpose(0, 1)
 
         for layer in self.layers:
             kwds = {}

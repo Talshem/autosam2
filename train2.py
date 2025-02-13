@@ -134,12 +134,17 @@ def sam2_call(videos, sam2, dense_embeddings):
             # empty prompt embedding using sam2 prompt encoder
             sparse_embeddings_none, dense_embeddings_none = sam2.sam_prompt_encoder(points=None, boxes=None, masks=None)
 
+            # Optional - I dont know if its true, encoding the first frame with no mask
+            # We should ask aviad how the memory attention handles the initial state where
+            # No memory is yet accumulated
+            encoded_memory = sam2.memory_encoder(image_embeddings, torch.zeros_like(videos[:, f]))
+
             if len(memory_bank) == 0:
                 memory_bank.append({
                     # appending to memory the features of the first frame
-                    "features": image_embeddings["vision_features"],
+                    "features": encoded_memory["vision_features"],
                     # takes positional encoding with highest resolution
-                    "pos_enc": image_embeddings["vision_pos_enc"][-1]
+                    "pos_enc": encoded_memory["vision_pos_enc"]
                 })
            
             # Converting to torch tensor

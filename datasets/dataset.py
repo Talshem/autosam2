@@ -113,10 +113,10 @@ class VideoLoader(torch.utils.data.Dataset):
                  sam_trans=None, loops=1):
         self.root = root
         if train:
-            self.video_root = os.path.join(self.root, 'Training', 'frames')
+            self.video_root = os.path.join(self.root, 'Training', 'images')
             self.masks_root = os.path.join(self.root, 'Training', 'mask')
         else:
-            self.video_root = os.path.join(self.root, 'Test', 'frames')
+            self.video_root = os.path.join(self.root, 'Test', 'images')
             self.masks_root = os.path.join(self.root, 'Test', 'mask')
         self.paths = os.listdir(self.video_root)
         self.transform = transform

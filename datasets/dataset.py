@@ -1,6 +1,6 @@
 import torch
 import PIL
-from PIL import Image
+from PIL import Image, ImageEnhance
 import os
 import pandas as pd
 import math
@@ -10,7 +10,6 @@ import torchvision.datasets as tvdataset
 from datasets.tfs import get_transform
 import cv2
 from tqdm import tqdm
-from PIL import ImageEnhance
 
 
 def _load_img_as_tensor(img_path, mask_path, image_size, vertical_flip_prob, horizontal_flip_prob, rotation_degree, scale_factor, brightness, contrast, saturation, hue):
@@ -83,14 +82,7 @@ def load_videos_from_jpg_images(
     image_size,
     start_idx,
     sequence_length,
-    vertical_flip_prob,
-    horizontal_flip_prob,
-    rotation_degree,
-    scale_factor,
-    brightness,
-    contrast,
-    saturation,
-    hue,
+    train,
     offload_video_to_cpu=False,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
@@ -134,6 +126,25 @@ def load_videos_from_jpg_images(
     images = torch.zeros(sequence_length, 3, image_size, image_size, dtype=torch.float32)
     masks = torch.zeros(sequence_length, 1, image_size, image_size, dtype=torch.float32)
   
+    if train:
+        vertical_flip_prob = random.random()
+        horizontal_flip_prob = random.random()
+        rotation_degree = random.uniform(-90, 90)
+        scale_factor = random.uniform(0.75, 1.25)
+        brightness = random.uniform(1 - 0.4, 1 + 0.4)
+        contrast = random.uniform(1 - 0.4, 1 + 0.4)
+        saturation = random.uniform(1 - 0.4, 1 + 0.4)
+        hue = random.uniform(-0.1, 0.1)
+    else:
+        vertical_flip_prob = 0
+        horizontal_flip_prob = 0
+        rotation_degree = 0
+        scale_factor = 1
+        brightness = 1
+        contrast = 1
+        saturation = 1
+        hue = 0
+        
     i = 0
     for img_path, mask_path in zip(img_paths, mask_paths):
         if img_path.endswith(valid_frames):
@@ -150,21 +161,6 @@ def load_videos_from_jpg_images(
 
     return images, masks, (video_height, video_width)
 
-
-def cv2_loader(path, is_mask):
-    files = os.listdir(path)
-    frames = []    
-    for f in sorted(files, key=lambda x: int(os.path.splitext(x)[0])):
-        if os.path.splitext(f)[-1] in ['.jpg', '.jpeg', '.JPG', '.JPEG']:
-            frame = cv2.imread(path, 0)
-            if is_mask:
-                frame[frame > 0] = 1
-            else:
-                frame = cv2.cvtColor(cv2.imread(path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-            frames.append(frame)
-    return frames
-
-
 import os
 import torch
 from torch.utils.data import Dataset
@@ -172,8 +168,7 @@ import random
 import torch.nn.functional as F
 
 class VideoDataset(Dataset):
-    def __init__(self, root, image_size, transform=None, target_transform=None, train=False, 
-                 loader=cv2_loader, sequence_length=8, loops=1):
+    def __init__(self, root, image_size, transform=None, target_transform=None, train=False, sequence_length=8, loops=1):
         self.root = root
         if train:
             self.video_root = os.path.join(self.root, 'Training', 'images')
@@ -187,7 +182,6 @@ class VideoDataset(Dataset):
         self.image_size = image_size
         self.loops = loops
         self.target_transform = target_transform
-        self.loader = loader
         self.train = train
         self.sequence_length = sequence_length
 
@@ -196,9 +190,8 @@ class VideoDataset(Dataset):
             video_path = os.path.join(self.video_root, video_name)
             frames = sorted(os.listdir(video_path))
             num_frames = len(frames)
-            num_sequences = num_frames // self.sequence_length
-            for seq in range(num_sequences):
-                start_idx = seq * self.sequence_length
+            num_sequences = num_frames - sequence_length + 1
+            for start_idx in range(num_sequences):
                 self.index_mapping.append((video_name, start_idx))
         
         self.total_items = len(self.index_mapping)
@@ -218,48 +211,40 @@ class VideoDataset(Dataset):
         video_path = os.path.join(self.video_root, video_name)
         mask_path = os.path.join(self.masks_root, video_name)
 
-        if self.train:
-            vertical_flip_prob = random.random()
-            horizontal_flip_prob = random.random()
-            rotation_degree = random.uniform(-90, 90)
-            scale_factor = random.uniform(0.75, 1.25)
-            brightness = random.uniform(1 - 0.4, 1 + 0.4)
-            contrast = random.uniform(1 - 0.4, 1 + 0.4)
-            saturation = random.uniform(1 - 0.4, 1 + 0.4)
-            hue = random.uniform(-0.1, 0.1)
-        else:
-            vertical_flip_prob = 0
-            horizontal_flip_prob = 0
-            rotation_degree = 0
-            scale_factor = 1
-            brightness = 1
-            contrast = 1
-            saturation = 1
-            hue = 0
-
         videos, gts, size = load_videos_from_jpg_images(
                             video_path,                                       
                             mask_path,
                             self.image_size,
                             start_idx,
                             self.sequence_length,
-                            vertical_flip_prob,
-                            horizontal_flip_prob,
-                            rotation_degree,
-                            scale_factor,
-                            brightness,
-                            contrast,
-                            saturation,
-                            hue
+                            self.train
+                            )
+
+        return videos, gts, torch.Tensor(size)
+    
+    def get_full_sequence(self, index):
+        video_path = os.path.join(self.video_root, index)
+        mask_path = os.path.join(self.masks_root, index)
+
+        frames = sorted(os.listdir(video_path))
+
+        videos, gts, size = load_videos_from_jpg_images(
+                            video_path,                                       
+                            mask_path,
+                            self.image_size,
+                            0,
+                            len(frames),
+                            self.train
                             )
 
         return videos, gts, torch.Tensor(size)
 
 
+
 def get_dataset(args):
     datadir = args['task']
     transform_train, transform_test = get_transform(datadir)
-    ds_train = VideoDataset(f"datasets/{datadir}", train=True, sequence_length=args['sequence_length'] ,transform=transform_train, image_size=args['size'], loops=5)
+    ds_train = VideoDataset(f"datasets/{datadir}", train=True, sequence_length=args['sequence_length'] ,transform=transform_train, image_size=args['size'], loops=1)
     ds_test = VideoDataset(f"datasets/{datadir}", train=False, sequence_length=args['sequence_length'] ,transform=transform_test, image_size=args['size'])
     return ds_train, ds_test
 

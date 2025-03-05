@@ -82,10 +82,9 @@ def load_videos_from_jpg_images(
     image_size,
     start_idx,
     sequence_length,
+    num_frames,
     train,
     offload_video_to_cpu=False,
-    img_mean=(0.485, 0.456, 0.406),
-    img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
 ):
@@ -120,11 +119,15 @@ def load_videos_from_jpg_images(
 
     img_paths = [os.path.join(video_path, fname) for fname in frame_names]
     mask_paths = [os.path.join(mask_path, fname) for fname in frame_names]
-
-    valid_frames = tuple(f"/{i}.jpg" for i in range(start_idx, start_idx + sequence_length))
-
-    images = torch.zeros(sequence_length, 3, image_size, image_size, dtype=torch.float32)
-    masks = torch.zeros(sequence_length, 1, image_size, image_size, dtype=torch.float32)
+    
+    if train:
+        valid_frames = tuple(f"/{i+1}.jpg" for i in range(start_idx, start_idx + sequence_length))
+        images = torch.zeros(sequence_length, 3, image_size, image_size, dtype=torch.float32)
+        masks = torch.zeros(sequence_length, 1, image_size, image_size, dtype=torch.float32)
+    else:
+        valid_frames = tuple(f"/{i+1}.jpg" for i in range(num_frames))
+        images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+        masks = torch.zeros(num_frames, 1, image_size, image_size, dtype=torch.float32)
   
     if train:
         vertical_flip_prob = random.random()
@@ -150,14 +153,6 @@ def load_videos_from_jpg_images(
         if img_path.endswith(valid_frames):
             images[i], masks[i], video_height, video_width = _load_img_as_tensor(img_path, mask_path, image_size, vertical_flip_prob, horizontal_flip_prob, rotation_degree, scale_factor, brightness, contrast, saturation, hue)
             i += 1
-            
-    if not offload_video_to_cpu:
-        images = images.to(compute_device)
-        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None].to(compute_device)
-        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None].to(compute_device)
-
-    images -= img_mean
-    images /= img_std
 
     return images, masks, (video_height, video_width)
 
@@ -168,7 +163,7 @@ import random
 import torch.nn.functional as F
 
 class VideoDataset(Dataset):
-    def __init__(self, root, image_size, transform=None, target_transform=None, train=False, sequence_length=8, loops=1):
+    def __init__(self, root, image_size, transform=None, target_transform=None, train=False, sequence_length=8, loops=1, epoch_length=2200):
         self.root = root
         if train:
             self.video_root = os.path.join(self.root, 'Training', 'images')
@@ -183,31 +178,34 @@ class VideoDataset(Dataset):
         self.loops = loops
         self.target_transform = target_transform
         self.train = train
+        self.train_length = epoch_length
         self.sequence_length = sequence_length
 
         self.index_mapping = []
-        for video_name in self.paths:
+        for video_name in sorted(self.paths, key=lambda x: int(x)):
             video_path = os.path.join(self.video_root, video_name)
             frames = sorted(os.listdir(video_path))
             num_frames = len(frames)
             num_sequences = num_frames - sequence_length + 1
-            for start_idx in range(num_sequences):
-                self.index_mapping.append((video_name, start_idx))
-        
-        self.total_items = len(self.index_mapping)
-        
+            if self.train:
+                for start_idx in range(num_sequences):
+                    self.index_mapping.append((video_name, start_idx, num_frames))
+            else:
+                self.index_mapping.append((video_name, 0, num_frames))
+            
+
+        self.total_items = min(len(self.index_mapping), epoch_length)
+
         if train:
-             print("Number of train data sequences:", self.total_items)
+            print("Number of train data sequences:", self.total_items)
         else:
-             print("Number of test data sequences:", self.total_items)
+            print("Number of test data sequences:", self.total_items)
 
     def __len__(self):
         return self.total_items * self.loops
 
     def __getitem__(self, index):
-        index = index % self.total_items
-        video_name, start_idx = self.index_mapping[index]
-
+        video_name, start_idx, num_frames = self.index_mapping[index % self.total_items]
         video_path = os.path.join(self.video_root, video_name)
         mask_path = os.path.join(self.masks_root, video_name)
 
@@ -217,28 +215,12 @@ class VideoDataset(Dataset):
                             self.image_size,
                             start_idx,
                             self.sequence_length,
+                            num_frames,
                             self.train
                             )
+        size_tensor = torch.Tensor(size)
 
-        return videos, gts, torch.Tensor(size)
-    
-    def get_full_sequence(self, index):
-        video_path = os.path.join(self.video_root, index)
-        mask_path = os.path.join(self.masks_root, index)
-
-        frames = sorted(os.listdir(video_path))
-
-        videos, gts, size = load_videos_from_jpg_images(
-                            video_path,                                       
-                            mask_path,
-                            self.image_size,
-                            0,
-                            len(frames),
-                            self.train
-                            )
-
-        return videos, gts, torch.Tensor(size)
-
+        return videos, gts, size_tensor
 
 
 def get_dataset(args):

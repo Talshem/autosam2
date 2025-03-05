@@ -16,6 +16,10 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.cuda import set_device
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import matplotlib.pyplot as plt
+import shutil
+import gc
+import json 
 
 NO_OBJ_SCORE = -1024.0
 
@@ -27,7 +31,25 @@ def norm_batch(x):
     x = (x - min_value) / (max_value - min_value + 1e-6)
     return x
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
+    def forward(self, inputs, targets):
+        prob = inputs.sigmoid()
+        ce_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        p_t =  prob * targets + (1 - prob) * (1 - targets)
+        loss = ce_loss * ((1 - p_t) ** self.gamma)
+
+        if self.alpha >= 0:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            loss = alpha_t * loss
+
+        return loss.mean()
+            
 def Dice_loss(y_true, y_pred, smooth=1):
     alpha = 0.5
     beta = 0.5
@@ -56,58 +78,59 @@ def open_folder(path):
     os.mkdir(path + '/gpu' + str(len(a)))
     return str(len(a))
 
+import os
 
-def gen_step(optimizer, gts, masks, criterion, accumulation_steps, step):
-    B, _, H, W = masks.shape
-    gts_sized = F.interpolate(gts.squeeze(2), size=(H, W), mode='nearest')
-    loss = criterion(masks, gts_sized) + Dice_loss(masks, gts_sized)
-    loss.backward()
-
-    if (step + 1) % accumulation_steps == 0:
-        optimizer.step()
-        optimizer.zero_grad()
-
-    return loss.item()
-
-def train_single_epoch(rank, dataset, model, sam2, optimizer, epoch, conn, args):
+def train_single_epoch(rank, dataset, model, sam2, epoch, conn, args):
     try:
         setup(rank, int(args['world_size']))
-        model = DDP(model.to(rank), device_ids=[rank], find_unused_parameters=True)
+        model.to(rank)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model.train()
+        optimizer = optim.Adam(model.parameters(),
+                        lr=float(args['learning_rate']),
+                        weight_decay=float(args['WD'])
+                        )
         sam2.to(rank)
+        sam2.eval()
         sampler = DistributedSampler(dataset, num_replicas=int(args['world_size']), rank=rank, shuffle=True)
+        sampler.set_epoch(epoch)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=int(args['Batch_size']), sampler=sampler, drop_last=True)
         progress_bar = tqdm(dataloader, desc=f'(Train | {args["task"]}) epoch {epoch}', disable=rank != 0)
         loss_list = []
-        criterion = nn.BCELoss()
-        optimizer.zero_grad() 
-
+        criterion = FocalLoss()
+        optimizer.zero_grad()
         for ix, (videos, gts, size) in enumerate(progress_bar):
-            videos = videos.to(rank)
-            gts = gts.to(rank)
-            output_dict = {
-            "cond_frame_outputs": {}, 
-            "non_cond_frame_outputs": {},
-        }
-            total_loss = 0.0
-            for t in range(args['sequence_length']):
-                dense_embeddings = model(videos[:, t])
-                masks = norm_batch(sam2_call(videos, sam2, dense_embeddings, output_dict, t, videos.shape))
-                loss = gen_step(optimizer, gts[:, t], masks, criterion, accumulation_steps=8, step=t)
-                total_loss += loss / args['sequence_length']
-            loss_tensor = torch.tensor([total_loss], device=rank)
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            average_loss = loss_tensor.item() / int(args['world_size'])
-            loss_list.append(average_loss)
+            try:
+                videos = videos.to(rank)
+                gts = gts.to(rank)
+                output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+                dense_embeddings = model(videos[:, 0])
+                for t in range(args['sequence_length']):
+                    masks = norm_batch(sam2_call(videos, sam2, dense_embeddings, output_dict, t, videos.shape))
+                    if t == args['sequence_length'] - 1:
+                        B, _, H, W = masks.shape
+                        gts_sized = F.interpolate(gts[:, t].squeeze(2), size=(H, W), mode='nearest')
+                        loss = criterion(masks, gts_sized) + Dice_loss(masks, gts_sized)
+                        loss.backward()
+                        if (ix + 1) % args['accumulation_steps'] == 0:
+                            optimizer.step()
+                            optimizer.zero_grad()
+                loss_item = loss.item()
+                loss_list.append(loss_item)
+
+            except Exception as e:
+                torch.save(model.module.state_dict(), args['path_recent'])
+                raise e
+                
             if rank == 0:
-                conn.send(average_loss)
+                conn.send(np.mean(loss_list))
                 progress_bar.set_description(
-                'Train | {task}) epoch {epoch} :: loss {loss:.4f}'.format(
-                    task=args["task"],
-                    epoch=epoch,
-                    loss=np.mean(loss_list)
-                ))
+                    f'Train | {args["task"]} epoch {epoch} :: loss {np.mean(loss_list):.4f}'
+                )
     except Exception as e:
         print(f"Error on rank {rank}: {e}")
+        raise e
+
     finally:
         dist.destroy_process_group()
 
@@ -215,52 +238,69 @@ def sam2_call(videos, sam2, dense_embeddings, output_dict, t, shape):
 def inference(dataset, model, sam2, transform, epoch, args):
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, drop_last=False)
     progress_bar = tqdm(dataloader, desc=f'(Inference | {args["task"]}) Epoch {epoch}')
+    model.eval()
+    sam2.eval()
     iou_list = []
     dice_list = []
     Idim = int(args['Idim'])
+    all_masks = []
+    all_gts = []
+    all_videos = []
     
     for videos, gts, size in progress_bar:
-        videos = videos.to(sam2.device)
-        gts = gts.to(sam2.device)
-        output_dict = {
-            "cond_frame_outputs": {}, 
-            "non_cond_frame_outputs": {},
-        }
-        predicted_masks = []
-        for t in range(args['sequence_length']):
-            dense_embeddings = model(videos[:, t])
-            masks = norm_batch(sam2_call(videos, sam2, dense_embeddings, output_dict, t, videos.shape))
-            predicted_masks.append(masks)
-        masks = torch.stack(predicted_masks, dim=1)  
-        original_size =  tuple([int(x) for x in size[0].squeeze().tolist()])
-        dice_total, ji_total = 0.0, 0.0
-        for t in range(args['sequence_length']):
-            mask = transform.postprocess_masks(masks[:, t], original_size)
-            gt = transform.postprocess_masks(gts[:, t], original_size)
-            mask = F.interpolate(mask, (Idim, Idim), mode='bilinear', align_corners=True)
-            gt = F.interpolate(gt, (Idim, Idim), mode='nearest')
-            mask[mask > 0.5] = 1
-            mask[mask <= 0.5] = 0
-            dice, ji = get_dice_ji(mask.squeeze().detach().cpu().numpy(),
-                            gt.squeeze().detach().cpu().numpy())
-            dice_total += dice
-            ji_total += ji
+        try:
+            videos = videos.to(sam2.device)
+            gts = gts.to(sam2.device)
+            output_dict = {
+                "cond_frame_outputs": {}, 
+                "non_cond_frame_outputs": {},
+            }
+            sequence_masks = []
+            sequence_gts = []
+            sequence_videos = []
+            original_size = tuple([int(x) for x in size[0].squeeze().tolist()])
+            dice_total, ji_total = 0.0, 0.0
+            dense_embeddings = model(videos[:, 0])
+            for t in range(videos.shape[1]):
+                mask = norm_batch(sam2_call(videos, sam2, dense_embeddings, output_dict, t, videos.shape))
+                mask = transform.postprocess_masks(mask, original_size)
+                gt = transform.postprocess_masks(gts[:, t], original_size)
+                mask = F.interpolate(mask, (Idim, Idim), mode='bilinear', align_corners=True)
+                gt = F.interpolate(gt, (Idim, Idim), mode='nearest')
+                mask[mask > 0.5] = 1
+                mask[mask <= 0.5] = 0
+                sequence_masks.append(mask.cpu())
+                sequence_gts.append(gts[:, t].cpu())
+                sequence_videos.append(videos[:, t].cpu())
+                dice, ji = get_dice_ji(mask.squeeze().detach().cpu().numpy(),
+                                         gt.squeeze().detach().cpu().numpy())
+                dice_total += dice
+                ji_total += ji
+                
+            all_masks.append(sequence_masks)
+            all_gts.append(sequence_gts)
+            all_videos.append(sequence_videos)
+            iou_list.append(ji_total / videos.shape[1])
+            dice_list.append(dice_total / videos.shape[1])
 
-        iou_list.append(ji_total / args['sequence_length'])
-        dice_list.append(dice_total / args['sequence_length'])   
+            progress_bar.set_description(
+            '(Inference | {task}) Epoch {epoch} :: Dice {dice:.4f} :: IoU {iou:.4f}'.format(
+                task=args['task'],
+                epoch=epoch,
+                dice=np.mean(dice_list),
+                iou=np.mean(iou_list)))
+            
+        except Exception as e:
+            print(f"Error processing video: {e}")
+            continue
 
-        progress_bar.set_description(
-        '(Inference | {task}) Epoch {epoch} :: Dice {dice:.4f} :: IoU {iou:.4f}'.format(
-            task=args['task'],
-            epoch=epoch,
-            dice=np.mean(dice_list),
-            iou=np.mean(iou_list)))
+        
+    return all_videos, all_masks, all_gts, iou_list, dice_list
 
-    return iou_list, dice_list
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = '12356'
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
     set_device(rank)
 
@@ -269,60 +309,99 @@ def main(args=None, sam_args=None):
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    model = ModelEmb(args=args).to(device)
+
+    if args['restart']:
+        results = {
+        "recent_epoch": 0, 
+        "loss": {},
+        "iou": {},
+        "dice": {},
+        "best_epoch": 0,
+        "best_mean_iou": -float('inf'),
+        "best_mean_dice": float('inf')
+    }
+        recent_epoch = 0
+        model = ModelEmb(args=args).to(device)
+
+    else:
+        with open(args['path_results'], "r") as f:
+            results = json.load(f)
+        recent_epoch = results['recent_epoch'] + 1
+        model = torch.load(args['path_recent']).to(device)
 
     sam2 = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     
     transform = SAM2Transforms(sam2.image_size, 0.5)
-    optimizer = optim.Adam(model.parameters(),
-                           lr=float(args['learning_rate']),
-                           weight_decay=float(args['WD'])
-                           )
+
     trainset, testset = get_dataset(args) 
 
-    path_best = 'results/gpu' + str(args['folder']) +  '/results.json'
-
-    results = {
-    "loss": {},
-    "iou": {},
-    "dice_loss": {},
-    "best_epoch": 0,
-    "best_mean_iou": -float('inf'),
-    "best_dice_loss": float('inf')
-}
-
-    for epoch in range(int(args['epoches'])):
+    for epoch in range(recent_epoch, int(args['epoches'])):
         parent_conn, child_conn = mp.Pipe()
-        # loss_list = train_single_epoch(trainset, model.train(), sam2.eval(), optimizer, epoch)
-        mp.spawn(train_single_epoch, args=(trainset, model.train(), sam2.eval(), optimizer, epoch, child_conn, args), nprocs=int(args['world_size']), join=True)
+        try:
+            mp.spawn(train_single_epoch, args=(trainset, model, sam2, epoch, child_conn, args), nprocs=int(args['world_size']), join=True)
+        except Exception as e:
+            print(f"mp.spawn failed on epoch {epoch} with error: {e}")
+            model.load_state_dict(torch.load(args['path_recent']))
         loss_list = []
         while parent_conn.poll():
             loss_list.append(parent_conn.recv())
         results['loss'][f"epoch_{epoch}"] = loss_list
+        model.to(device)
+        sam2.to(device)
         with torch.no_grad():
-            IoU_list, dice_list = inference(testset, model.eval(), sam2, transform, epoch, args)
+            videos, masks, gts, IoU_list, dice_list = inference(testset, model, sam2, transform, epoch, args)
             IoU_val = np.mean(IoU_list)
             results["iou"][f"epoch_{epoch}"] = IoU_list
-            results["dice_loss"][f"epoch_{epoch}"] = dice_list
+            results["dice"][f"epoch_{epoch}"] = dice_list
+            torch.save(model, args['path_recent'])
+            results['recent_epoch'] = epoch
             if IoU_val > results['best_mean_iou']:
                 torch.save(model, args['path_best'])
                 results['best_mean_iou'] = IoU_val
-                results['best_dice_loss'] = np.mean(dice_list)
+                results['best_mean_dice'] = np.mean(dice_list)
                 results['best_epoch'] = epoch
                 print('best results: ' + str(results['best_mean_iou']))
+                if os.path.exists(args['figures_folder']):
+                    shutil.rmtree(args['figures_folder']) 
+                os.makedirs(args['figures_folder'], exist_ok=True)  
+                for j in range(len(videos)):
+                    fig, axes = plt.subplots(3, 8, figsize=(16, 6))
+                    fig.suptitle(f"IoU: {IoU_list[j]}, Dice Loss: {dice_list[j]}", fontsize=16)
+                    for i in range(args['sequence_length']):
+                        frame = (videos[j][i].squeeze().permute(1, 2, 0)).clamp(0,1)
+                        axes[0, i].imshow(frame.numpy()) 
+                        axes[0, i].axis('off')
 
-        with open(path_best, 'w') as f:
+                        axes[1, i].imshow(masks[j][i].squeeze().numpy(), cmap="gray") 
+                        axes[1, i].axis('off')
+
+                        axes[2, i].imshow(gts[j][i].squeeze().numpy(), cmap="gray") 
+                        axes[2, i].axis('off')
+
+                    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+                    plt.tight_layout()
+                    fig_path = os.path.join(args['figures_folder'], f"{j}.png")
+                    plt.savefig(fig_path, bbox_inches='tight', dpi=300)
+                    plt.close(fig) 
+
+
+        with open(args['path_results'], 'w') as f:
             json.dump(results, f, indent=4)
             f.flush()
 
 if __name__ == '__main__':
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,5"
+    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+    os.environ["NCCL_TIMEOUT"] = "60"
+    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1" 
     torch.cuda.empty_cache()
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+    gc.collect()
     import argparse
     parser = argparse.ArgumentParser(description='Description of your program')
     parser.add_argument('-lr', '--learning_rate', default=0.0003, help='learning_rate', required=False)
-    parser.add_argument('-bs', '--Batch_size', default=3, help='batch_size', required=False)
+    parser.add_argument('-bs', '--Batch_size', default=2, help='batch_size', required=False)
     parser.add_argument('-epoches', '--epoches', default=100, help='number of epoches', required=False)
+    parser.add_argument('-accumulation_steps', '--accumulation_steps', default=1, help='number of epoches', required=False)
     parser.add_argument('-world_size', '--world_size', default=4, help='evaluation iteration', required=False)
     parser.add_argument('-WD', '--WD', default=1e-4, help='evaluation iteration', required=False)
     parser.add_argument('-task', '--task', default='polypgen', help='evaluation iteration', required=False)
@@ -331,21 +410,23 @@ if __name__ == '__main__':
     parser.add_argument('-sequence_length', '--sequence_length', default=8, help='image size', required=False)
     parser.add_argument('-Idim', '--Idim', default=512, help='image size', required=False)
     parser.add_argument('-size', '--size', default=1024, help='image size', required=False)
-    parser.add_argument('-rotate', '--rotate', default=22, help='image size', required=False)
-    parser.add_argument('-scale1', '--scale1', default=0.75, help='image size', required=False)
-    parser.add_argument('-scale2', '--scale2', default=1.25, help='image size', required=False)
+    parser.add_argument('-restart', '--restart', default=False, help='image size', required=False)
     args = vars(parser.parse_args())
     os.makedirs('results', exist_ok=True)
-    folder = open_folder('results')
+    # folder = open_folder('results')
+    folder = '0'
     args['folder'] = folder
-    args['path'] = os.path.join('results',
-                                'gpu' + folder,
-                                'net_last.pth')
     args['path_best'] = os.path.join('results',
                                      'gpu' + folder,
                                      'net_best.pth')
-    args['vis_folder'] = os.path.join('results', 'gpu' + args['folder'], 'vis')
-    os.mkdir(args['vis_folder'])
+    args['path_recent'] = os.path.join('results',
+                                     'gpu' + folder,
+                                     'net_recent.pth')
+    args['path_results'] = os.path.join('results',
+                                    'gpu' + folder,
+                                    'results.json')
+
+    args['figures_folder'] = os.path.join('results', 'gpu' + args['folder'], 'figures')
     sam_args = {
         'sam_checkpoint': "sam2/checkpoints/sam2.1_hiera_large.pth",
         'sam_config': "sam2/sam2_hiera_l.yaml",

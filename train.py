@@ -183,55 +183,54 @@ def sam2_call(videos, sam2, dense_embeddings, output_dict, t, shape):
     high_res_features=high_res_features,
 )   
 
-    with torch.no_grad():
-        is_obj_appearing = object_score_logits > 0
+    is_obj_appearing = object_score_logits > 0
 
-        low_res_multimasks_ = torch.where(
-            is_obj_appearing[:, None, None],
-            low_res_multimasks.clone(),
-            NO_OBJ_SCORE,
-        )
+    low_res_multimasks_ = torch.where(
+        is_obj_appearing[:, None, None],
+        low_res_multimasks.clone(),
+        NO_OBJ_SCORE,
+    )
 
-        low_res_multimasks_ = low_res_multimasks_.float()
+    low_res_multimasks_ = low_res_multimasks_.float()
 
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks_,
-            size=(sam2.image_size, sam2.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+    high_res_multimasks = F.interpolate(
+        low_res_multimasks_,
+        size=(sam2.image_size, sam2.image_size),
+        mode="bilinear",
+        align_corners=False,
+    )
 
-        sam_output_token = sam_output_tokens[:, 0]
+    sam_output_token = sam_output_tokens[:, 0]
 
-        obj_ptr = sam2.obj_ptr_proj(sam_output_token)
+    obj_ptr = sam2.obj_ptr_proj(sam_output_token)
 
-        if sam2.pred_obj_scores:
-            if sam2.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
+    if sam2.pred_obj_scores:
+        if sam2.soft_no_obj_ptr:
+            lambda_is_obj_appearing = object_score_logits.sigmoid()
+        else:
+            lambda_is_obj_appearing = is_obj_appearing.float()
 
-            if sam2.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * sam2.no_obj_ptr
+        if sam2.fixed_no_obj_ptr:
+            obj_ptr = lambda_is_obj_appearing * obj_ptr
+        obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * sam2.no_obj_ptr
 
-        current_out["pred_masks"] = low_res_multimasks
-        current_out["pred_masks_high_res"] = high_res_multimasks
-        current_out["obj_ptr"] = obj_ptr
+    current_out["pred_masks"] = low_res_multimasks
+    current_out["pred_masks_high_res"] = high_res_multimasks
+    current_out["obj_ptr"] = obj_ptr
 
-        maskmem_features, maskmem_pos_enc = sam2._encode_new_memory(
-            vision_feats,
-            feat_sizes,
-            high_res_multimasks,
-            object_score_logits,
-            False,
-        )
+    maskmem_features, maskmem_pos_enc = sam2._encode_new_memory(
+        vision_feats,
+        feat_sizes,
+        high_res_multimasks,
+        object_score_logits,
+        False,
+    )
 
-        output_dict["cond_frame_outputs"][t] = {
-            "obj_ptr": obj_ptr,
-            "maskmem_features":maskmem_features,
-            "maskmem_pos_enc":maskmem_pos_enc
-            }
+    output_dict["cond_frame_outputs"][t] = {
+        "obj_ptr": obj_ptr,
+        "maskmem_features":maskmem_features,
+        "maskmem_pos_enc":maskmem_pos_enc
+        }
 
     return low_res_multimasks
 

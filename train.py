@@ -158,20 +158,20 @@ def sam2_call(videos, sam2, dense_embeddings, output_dict, t, shape):
         else:
             high_res_features = None
 
-        pix_feat = sam2._prepare_memory_conditioned_features(
-            frame_idx=t,
-            is_init_cond_frame=t==0,
-            current_vision_feats=vision_feats[-1:],
-            current_vision_pos_embeds=vision_pos_embeds[-1:],
-            feat_sizes=feat_sizes[-1:],
-            output_dict=output_dict,
-            num_frames=T,
-        )
+    pix_feat = sam2._prepare_memory_conditioned_features(
+        frame_idx=t,
+        is_init_cond_frame=t==0,
+        current_vision_feats=vision_feats[-1:],
+        current_vision_pos_embeds=vision_pos_embeds[-1:],
+        feat_sizes=feat_sizes[-1:],
+        output_dict=output_dict,
+        num_frames=T,
+    )
 
-        sam_point_coords = torch.zeros(B, 1, 2, device=sam2.device)
-        sam_point_labels = -torch.ones(B, 1, dtype=torch.int32, device=sam2.device)
+    sam_point_coords = torch.zeros(B, 1, 2, device=sam2.device)
+    sam_point_labels = -torch.ones(B, 1, dtype=torch.int32, device=sam2.device)
 
-        sparse_embeddings_none, dense_embeddings_none = sam2.sam_prompt_encoder(points=(sam_point_coords,sam_point_labels), boxes=None, masks=None)
+    sparse_embeddings_none, dense_embeddings_none = sam2.sam_prompt_encoder(points=(sam_point_coords,sam_point_labels), boxes=None, masks=None)
     
     low_res_multimasks, ious, sam_output_tokens, object_score_logits = sam2.sam_mask_decoder(
     image_embeddings=pix_feat,

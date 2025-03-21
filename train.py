@@ -185,16 +185,16 @@ def sam2_call(videos, sam2, dense_embeddings, output_dict, t, shape):
 
     is_obj_appearing = object_score_logits > 0
 
-    low_res_multimasks_ = torch.where(
+    low_res_multimasks = torch.where(
         is_obj_appearing[:, None, None],
-        low_res_multimasks.clone(),
+        low_res_multimasks,
         NO_OBJ_SCORE,
     )
 
-    low_res_multimasks_ = low_res_multimasks_.float()
+    low_res_multimasks = low_res_multimasks.float()
 
     high_res_multimasks = F.interpolate(
-        low_res_multimasks_,
+        low_res_multimasks,
         size=(sam2.image_size, sam2.image_size),
         mode="bilinear",
         align_corners=False,
